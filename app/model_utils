@@ -1,0 +1,144 @@
+from functools import lru_cache
+import os
+from typing import Dict
+
+import torch
+import torch.nn as nn
+from PIL import Image
+from torchvision import models, transforms
+
+# =========================
+# GLOBAL CONFIG
+# =========================
+BASE_DIR = "/content/drive/MyDrive/generative_ai_project"
+IMAGE_SIZE = 128
+THRESHOLD = 0.35
+
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+# If your checkpoints use a different folder name, change only these paths.
+MODEL_PATHS: Dict[str, str] = {
+    "Baseline (A)": os.path.join(BASE_DIR, "classifier_final_A", "best_model.pth"),
+    "Traditional Augmentation (B)": os.path.join(BASE_DIR, "classifier_final_B", "best_model.pth"),
+    "GAN Augmentation (C)": os.path.join(BASE_DIR, "classifier_final", "best_model.pth"),
+    "GAN + Traditional (D)": os.path.join(BASE_DIR, "classifier_final_D", "best_model.pth"),
+}
+
+# In your final trained classifiers, higher probability corresponds to NORMAL.
+# If one checkpoint behaves inverted, change this constant.
+HIGH_PROB_LABEL = "NORMAL"
+
+# =========================
+# PREPROCESSING
+# =========================
+transform = transforms.Compose([
+    transforms.Resize((IMAGE_SIZE, IMAGE_SIZE)),
+    transforms.Grayscale(num_output_channels=1),
+    transforms.ToTensor(),
+    transforms.Normalize((0.5,), (0.5,))
+])
+
+# =========================
+# MODEL DEFINITION
+# =========================
+def build_model() -> nn.Module:
+    model = models.densenet121(weights=None)
+
+    # Adapt first conv layer for grayscale input
+    model.features.conv0 = nn.Conv2d(
+        1, 64, kernel_size=7, stride=2, padding=3, bias=False
+    )
+
+    # Binary classification head
+    num_features = model.classifier.in_features
+    model.classifier = nn.Linear(num_features, 1)
+
+    return model
+
+
+def _extract_state_dict(checkpoint):
+    """
+    Supports:
+    - plain state_dict
+    - checkpoint dict with keys like 'model', 'state_dict', 'model_state_dict'
+    """
+    if isinstance(checkpoint, dict):
+        for key in ["state_dict", "model_state_dict", "model", "net"]:
+            if key in checkpoint and isinstance(checkpoint[key], dict):
+                return checkpoint[key]
+
+        # If dict values are all tensors, it likely already is a state_dict
+        if all(torch.is_tensor(v) for v in checkpoint.values()):
+            return checkpoint
+
+    return checkpoint
+
+
+def _clean_state_dict_keys(state_dict):
+    """
+    Removes 'module.' prefix if the checkpoint was saved using DataParallel.
+    """
+    cleaned = {}
+    for k, v in state_dict.items():
+        new_k = k.replace("module.", "", 1) if k.startswith("module.") else k
+        cleaned[new_k] = v
+    return cleaned
+
+
+@lru_cache(maxsize=8)
+def load_model(model_name: str) -> nn.Module:
+    if model_name not in MODEL_PATHS:
+        raise ValueError(
+            f"Unknown model '{model_name}'. Available: {list(MODEL_PATHS.keys())}"
+        )
+
+    model_path = MODEL_PATHS[model_name]
+    if not os.path.exists(model_path):
+        raise FileNotFoundError(f"Model checkpoint not found: {model_path}")
+
+    model = build_model()
+
+    try:
+        checkpoint = torch.load(model_path, map_location=DEVICE, weights_only=False)
+    except TypeError:
+        checkpoint = torch.load(model_path, map_location=DEVICE)
+    except Exception:
+        checkpoint = torch.load(model_path, map_location=DEVICE)
+
+    state_dict = _extract_state_dict(checkpoint)
+    if isinstance(state_dict, dict):
+        state_dict = _clean_state_dict_keys(state_dict)
+
+    model.load_state_dict(state_dict, strict=True)
+    model = model.to(DEVICE)
+    model.eval()
+    return model
+
+
+@torch.inference_mode()
+def predict_image(image: Image.Image, model_name: str, threshold: float = THRESHOLD):
+    """
+    Returns:
+        dict with:
+            label: NORMAL or PNEUMONIA
+            confidence: confidence of predicted class
+            probability: raw sigmoid probability
+    """
+    model = load_model(model_name)
+
+    x = transform(image).unsqueeze(0).to(DEVICE)
+    logits = model(x)
+    prob = torch.sigmoid(logits).item()
+
+    if HIGH_PROB_LABEL == "NORMAL":
+        label = "NORMAL" if prob >= threshold else "PNEUMONIA"
+        confidence = prob if label == "NORMAL" else (1.0 - prob)
+    else:
+        label = "PNEUMONIA" if prob >= threshold else "NORMAL"
+        confidence = prob if label == "PNEUMONIA" else (1.0 - prob)
+
+    return {
+        "label": label,
+        "confidence": confidence,
+        "probability": prob,
+    }
